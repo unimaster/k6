@@ -55,6 +55,10 @@ const (
 	// This timeout should be long enough to flush all remaining traces, but still
 	// provides a safeguard to not block indefinitely.
 	waitForTracerProviderStopTimeout = 3 * time.Minute
+
+	// On a hard stop, e.g. a second Ctrl+C, k6 must exit promptly, so it only gives the
+	// tracer provider a short time to export the spans that have ended.
+	waitForTracerProviderStopOnHardStopTimeout = 3 * time.Second
 )
 
 // TODO: split apart some more
@@ -78,22 +82,18 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	// the browser module ending any open spans), but before globalCtx is
 	// cancelled by globalCancel above, since it derives its own timeout from
 	// globalCtx.
-	var shutdownTracerProvider func()
+	var shutdownTracerProvider func(timeout time.Duration)
+	// testRun is the span of the whole test run, ended right before the tracer
+	// provider is shut down so it gets exported with the rest of the spans.
+	var testRun *trace.TestRun
 	defer func() {
+		if testRun != nil {
+			testRun.End(err)
+		}
 		if shutdownTracerProvider != nil {
-			shutdownTracerProvider()
+			shutdownTracerProvider(waitForTracerProviderStopTimeout)
 		}
 	}()
-
-	// lingerCtx is cancelled by Ctrl+C, and is used to wait for that event when
-	// k6 was started with the --linger option.
-	lingerCtx, lingerCancel := context.WithCancel(globalCtx)
-	defer lingerCancel()
-
-	// runCtx is used for the test run execution and is created with the special
-	// execution.NewTestRunContext() function so that it can be aborted even
-	// from sub-contexts while also attaching a reason for the abort.
-	runCtx, runAbort := execution.NewTestRunContext(lingerCtx, logger)
 
 	emitEvent := func(evt *event.Event) func() {
 		waitDone := c.gs.Events.Emit(evt)
@@ -131,13 +131,27 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	if err = c.setupTracerProvider(globalCtx, test); err != nil {
 		return err
 	}
-	shutdownTracerProvider = func() {
-		ctx, cancel := context.WithTimeout(globalCtx, waitForTracerProviderStopTimeout)
+	shutdownTracerProvider = func(timeout time.Duration) {
+		ctx, cancel := context.WithTimeout(globalCtx, timeout)
 		defer cancel()
 		if tpErr := test.preInitState.TracerProvider.Shutdown(ctx); tpErr != nil {
 			logger.Errorf("The tracer provider didn't stop gracefully: %v", tpErr)
 		}
 	}
+
+	// testCtx is globalCtx carrying the run span, so that the execution contexts derived
+	// from it below, and the teardown, are part of the test run trace.
+	testCtx, testRun := trace.StartTestRun(globalCtx, trace.Tracer(test.preInitState.TracerProvider), logger)
+
+	// lingerCtx is cancelled by Ctrl+C, and is used to wait for that event when
+	// k6 was started with the --linger option.
+	lingerCtx, lingerCancel := context.WithCancel(testCtx)
+	defer lingerCancel()
+
+	// runCtx is used for the test run execution and is created with the special
+	// execution.NewTestRunContext() function so that it can be aborted even
+	// from sub-contexts while also attaching a reason for the abort.
+	runCtx, runAbort := execution.NewTestRunContext(lingerCtx, logger)
 
 	// Write the full consolidated *and derived* options back to the Runner.
 	conf := test.derivedConfig
@@ -413,6 +427,10 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	}
 	onHardStop := func(sig os.Signal) {
 		logger.WithField("sig", sig).Error("Aborting k6 in response to signal")
+		// k6 exits right after this, without running the deferred functions, so this is the
+		// last chance to export the run span and the spans that have already ended.
+		testRun.End(fmt.Errorf("test run was aborted because k6 received a second '%s' signal", sig))
+		shutdownTracerProvider(waitForTracerProviderStopOnHardStopTimeout)
 		globalCancel() // not that it matters, given that os.Exit() will be called right after
 	}
 	stopSignalHandling := handleTestAbortSignals(c.gs, gracefulStop, onHardStop)
@@ -449,7 +467,8 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 
 	// Start the test! However, we won't immediately return if there was an
 	// error, we still have things to do.
-	err = execScheduler.Run(globalCtx, runCtx, samples)
+	err = execScheduler.Run(testCtx, runCtx, samples)
+	testRun.MarkFinished()
 
 	waitTestEndDone := emitEvent(&event.Event{Type: event.TestEnd})
 	defer waitTestEndDone()
