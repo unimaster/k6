@@ -235,7 +235,7 @@ func TestChromiumConnectOverCDPTraceLinkage(t *testing.T) {
 	require.True(t, ok, "expected a 'browser.newPage' span")
 
 	// The browser API span must be parented under the k6 iteration span. If
-	// startConnectTrace did not wire the tracer into the browser's context,
+	// withTracer did not wire the tracer into the browser's context,
 	// browser.newPage would be a noop/orphaned span and these assertions would fail.
 	require.Equal(t, iterSpan.TraceID, newPageSpan.TraceID,
 		"browser.newPage span should be in the same trace as the iteration span")

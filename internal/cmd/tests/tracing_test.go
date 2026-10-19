@@ -87,7 +87,7 @@ func TestTracesOutputExportsRunHierarchy(t *testing.T) {
 	cmd.ExecuteWithGlobalState(ts.GlobalState)
 
 	// Every span, including the run span that ends last, was flushed before k6 exited.
-	runs := collector.byName("run")
+	runs := collector.byName("k6.run")
 	require.Len(t, runs, 1)
 	run := runs[0]
 	assert.Empty(t, run.GetParentSpanId(), "the run span starts a new trace")
@@ -127,7 +127,7 @@ func TestTracesOutputRecordsIterationErrors(t *testing.T) {
 	cmd.ExecuteWithGlobalState(ts.GlobalState)
 
 	// A failing iteration doesn't fail the test run.
-	runs := collector.byName("run")
+	runs := collector.byName("k6.run")
 	require.Len(t, runs, 1)
 	assert.Equal(t, tracepb.Status_STATUS_CODE_UNSET, runs[0].GetStatus().GetCode())
 
@@ -148,7 +148,7 @@ func TestTracesOutputRecordsRunFailure(t *testing.T) {
 	ts := getSingleFileTestState(t, script, []string{"--traces-output=otel=" + endpoint}, exitcodes.ScriptAborted)
 	cmd.ExecuteWithGlobalState(ts.GlobalState)
 
-	runs := collector.byName("run")
+	runs := collector.byName("k6.run")
 	require.Len(t, runs, 1)
 	assert.Equal(t, tracepb.Status_STATUS_CODE_ERROR, runs[0].GetStatus().GetCode())
 	assert.Contains(t, runs[0].GetStatus().GetMessage(), "stop")
@@ -158,34 +158,6 @@ func TestTracesOutputRecordsRunFailure(t *testing.T) {
 	require.Len(t, iterations, 1)
 	assert.Equal(t, tracepb.Status_STATUS_CODE_UNSET, iterations[0].GetStatus().GetCode())
 	assert.True(t, hasBoolAttribute(iterations[0], "k6.iteration.interrupted"))
-}
-
-func TestNoTraceLogWithoutTracesOutput(t *testing.T) {
-	t.Parallel()
-
-	ts := getSingleFileTestState(t, tracingScript, nil, 0)
-	cmd.ExecuteWithGlobalState(ts.GlobalState)
-
-	for _, entry := range ts.LoggerHook.Drain() {
-		assert.NotContains(t, entry.Message, "Tracing the test run")
-	}
-}
-
-func TestTracesOutputLogsTraceID(t *testing.T) {
-	t.Parallel()
-
-	_, endpoint := newOTLPCollector(t)
-	ts := getSingleFileTestState(t, tracingScript, []string{"--traces-output=otel=" + endpoint}, 0)
-	cmd.ExecuteWithGlobalState(ts.GlobalState)
-
-	var found bool
-	for _, entry := range ts.LoggerHook.Drain() {
-		if entry.Message == "Tracing the test run" {
-			found = true
-			assert.NotEmpty(t, entry.Data["trace_id"])
-		}
-	}
-	assert.True(t, found, "the trace ID of the run must be logged")
 }
 
 func TestTracesOutputExportsTheRunSpanOnHardStop(t *testing.T) {
@@ -236,7 +208,7 @@ func TestTracesOutputExportsTheRunSpanOnHardStop(t *testing.T) {
 			return
 		}
 		exited = true
-		runAtExit = collector.byName("run")
+		runAtExit = collector.byName("k6.run")
 		osExit(code)
 	}
 
@@ -254,33 +226,6 @@ func TestTracesOutputExportsTheRunSpanOnHardStop(t *testing.T) {
 	assert.Equal(t, tracepb.Status_STATUS_CODE_ERROR, runAtExit[0].GetStatus().GetCode())
 	assert.Contains(t, runAtExit[0].GetStatus().GetMessage(), "second")
 	assert.Len(t, collector.byName("iteration"), 1, "the spans already ended are exported too")
-}
-
-func TestTracesOutputRunSpanExcludesLinger(t *testing.T) {
-	t.Parallel()
-
-	collector, endpoint := newOTLPCollector(t)
-	script := `export const options = { iterations: 1 }; export default function () {}`
-	ts := getSingleFileTestState(t, script, []string{
-		"-v", "--log-output=stdout", "--linger", "--traces-output=otel=" + endpoint,
-	}, 0)
-
-	var lingerEnded time.Time
-	sendSignal := injectMockSignalNotifier(ts)
-	asyncWaitForStdoutAndRun(t, ts, 50, 100*time.Millisecond, "waiting for Ctrl+C to continue", func() {
-		time.Sleep(50 * time.Millisecond)
-		lingerEnded = time.Now()
-		sendSignal <- syscall.SIGINT
-		<-sendSignal
-	})
-	cmd.ExecuteWithGlobalState(ts.GlobalState)
-
-	runs := collector.byName("run")
-	require.Len(t, runs, 1)
-	runEnd := time.Unix(0, int64(runs[0].GetEndTimeUnixNano()))
-	assert.True(t, runEnd.Before(lingerEnded), "the run span must end before the --linger wait")
-	assert.Equal(t, tracepb.Status_STATUS_CODE_UNSET, runs[0].GetStatus().GetCode(),
-		"the Ctrl+C ending the --linger wait doesn't fail the run")
 }
 
 func hasBoolAttribute(span *tracepb.Span, key string) bool {

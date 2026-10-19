@@ -16,7 +16,7 @@ const instrumentationName = "go.k6.io/k6"
 
 // Span names of the k6 execution hierarchy: run -> scenario -> VU -> iteration.
 const (
-	SpanRun       = "run"
+	SpanRun       = "k6.run"
 	SpanScenario  = "scenario"
 	SpanVU        = "vu"
 	SpanIteration = "iteration"
@@ -83,16 +83,7 @@ func StartTestRun(
 		return ctx, &TestRun{span: noop.Span{}}
 	}
 	ctx, span := tracer.Start(ctx, SpanRun, oteltrace.WithNewRoot())
-
-	sc := span.SpanContext()
-	switch {
-	case sc.IsSampled():
-		logger.WithField("trace_id", sc.TraceID()).Info("Tracing the test run")
-	case sc.IsValid():
-		logger.WithField("trace_id", sc.TraceID()).
-			Warn("The test run trace isn't sampled, its spans won't be exported")
-	}
-
+	logger.Info("Tracing the test run")
 	return ctx, &TestRun{span: span}
 }
 

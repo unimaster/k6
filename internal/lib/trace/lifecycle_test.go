@@ -7,12 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"go.k6.io/k6/v2/internal/lib/testutils"
@@ -128,22 +126,6 @@ func TestTestRunEndsOnce(t *testing.T) {
 	require.Len(t, runSpan, 1)
 	assert.Len(t, runSpan[0].Events(), 1, "the error must be recorded once")
 	assert.Equal(t, codes.Error, runSpan[0].Status().Code)
-}
-
-func TestStartTestRunWarnsWhenNotSampled(t *testing.T) {
-	t.Parallel()
-
-	tp, rec := tracetest.NewProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
-	logger, hook := testutils.NewLoggerWithHook(t, logrus.InfoLevel, logrus.WarnLevel)
-
-	_, run := k6trace.StartTestRun(context.Background(), k6trace.Tracer(tp), logger)
-	run.End(nil)
-
-	entries := hook.Drain()
-	require.Len(t, entries, 1)
-	assert.Equal(t, logrus.WarnLevel, entries[0].Level)
-	assert.Contains(t, entries[0].Message, "isn't sampled")
-	assert.Empty(t, rec.Ended())
 }
 
 func TestStartFunctionsWithoutTracer(t *testing.T) {

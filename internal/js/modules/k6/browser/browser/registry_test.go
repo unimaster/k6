@@ -369,9 +369,9 @@ func TestTracesMetadataOnIterationSpan(t *testing.T) {
 		m:              make(map[int64]*common.Browser),
 		userManaged:    make(map[int64][]*common.Browser),
 	}
-	ctx := r.startConnectTrace(vu.Context())
+	ctx := r.withTracer(vu.Context())
 	// Connecting again in the same iteration must not change anything either.
-	r.startConnectTrace(vu.Context())
+	r.withTracer(vu.Context())
 	require.Equal(t, 1, rec.Len(), "the browser must not start spans of its own to trace an iteration")
 
 	// The spans of the browser APIs are children of the k6 iteration span.
@@ -406,7 +406,7 @@ func TestLiveNavigationSpansEndWithTheIteration(t *testing.T) {
 	// A non-browser iteration, so no browser is launched; connectOverCDP initializes the tracer.
 	delete(vu.StateField.Options.Scenarios["default"].GetScenarioOptions().Browser, "type")
 	vu.StartIteration(t, k6test.WithIteration(0))
-	ctx := r.startConnectTrace(vu.Context())
+	ctx := r.withTracer(vu.Context())
 	tracer := common.GetTracer(ctx)
 	_, navSpan := tracer.TraceNavigation(ctx, "target")
 	navSpanID := navSpan.SpanContext().SpanID()

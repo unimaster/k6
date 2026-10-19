@@ -504,12 +504,6 @@ func (r *browserRegistry) withTracer(ctx context.Context) context.Context {
 	return common.WithTracer(ctx, r.tracer)
 }
 
-// startConnectTrace returns a context carrying the tracer, so browser API calls made
-// over a connectOverCDP browser are parented under the k6 iteration span in vuCtx.
-func (r *browserRegistry) startConnectTrace(vuCtx context.Context) context.Context {
-	return r.withTracer(vuCtx)
-}
-
 func isBrowserIter(vu k6modules.VU) bool {
 	opts := k6ext.GetScenarioOpts(vu.Context(), vu)
 	_, ok := opts["type"] // Check if browser type option is set
