@@ -263,7 +263,7 @@ func (r *Runner) newVU(
 	if r.preInitState.TracerProvider != nil {
 		vu.state.TracerProvider = r.preInitState.TracerProvider
 	}
-	vu.tracer = k6trace.Tracer(r.preInitState.TracerProvider)
+	vu.tracer = k6trace.Tracer(r.preInitState.TracerProvider, r.preInitState.FeatureFlags)
 	vu.moduleVUImpl.state = vu.state
 	_ = vu.Runtime.Set("console", vu.Console)
 
@@ -747,7 +747,8 @@ type VU struct {
 	setupData sobek.Value
 
 	state *lib.State
-	// tracer creates the VU and iteration spans. It is nil when tracing is disabled.
+	// tracer creates the VU and iteration spans. It is nil when tracing, or the
+	// native-tracing feature flag, is disabled.
 	tracer oteltrace.Tracer
 	// count of iterations executed by this VU in each scenario
 	scenarioIter map[string]uint64
@@ -899,14 +900,17 @@ func (u *ActiveVU) RunOnce() (err error) {
 
 	ctx, cancel := context.WithCancel(u.vuCtx)
 	defer cancel()
-	// The iteration context, carrying the iteration span, is only exposed to the modules
-	// during the iteration.
-	previousCtx := u.moduleVUImpl.ctx
-	defer func() {
-		u.moduleVUImpl.ctx = previousCtx
-	}()
 
 	ctx, iterSpan := k6trace.StartIteration(ctx, u.tracer, u.iterationInfo())
+	// After the iteration, the modules keep its context, which is done, but it carries the
+	// VU span instead of the iteration span, which has ended.
+	afterIterCtx := ctx
+	if u.tracer != nil {
+		afterIterCtx = oteltrace.ContextWithSpan(ctx, oteltrace.SpanFromContext(u.vuCtx))
+	}
+	defer func() {
+		u.moduleVUImpl.ctx = afterIterCtx
+	}()
 	iterationSpanEnded := false
 	defer func() {
 		// The iteration span is normally ended after IterEnd below, this only ends it
@@ -940,7 +944,7 @@ func (u *ActiveVU) RunOnce() (err error) {
 	u.emitAndWaitEvent(&event.Event{Type: event.IterEnd, Data: eventIterData})
 	k6trace.EndIteration(iterSpan, err, isInterrupted(isFullIteration, err))
 	iterationSpanEnded = true
-	u.moduleVUImpl.ctx = previousCtx
+	u.moduleVUImpl.ctx = afterIterCtx
 
 	// If MinIterationDuration is specified and the iteration wasn't canceled
 	// and was less than it, sleep for the remainder
@@ -957,12 +961,19 @@ func (u *ActiveVU) RunOnce() (err error) {
 	return err
 }
 
-// isInterrupted reports whether an iteration was interrupted rather than failed: its context
-// was done, e.g. at the end of its scenario, or the script aborted the test, which only
-// interrupts the runtime.
+// isInterrupted reports whether an iteration was interrupted rather than failed: the script
+// aborted the test, which only interrupts the runtime, or its context was done, e.g. at the
+// end of its scenario, and it didn't fail otherwise, e.g. with an exception thrown right
+// before the interruption.
 func isInterrupted(isFullIteration bool, err error) bool {
-	_, aborted := errors.AsType[*errext.InterruptError](err)
-	return !isFullIteration || aborted
+	if _, aborted := errors.AsType[*errext.InterruptError](err); aborted {
+		return true
+	}
+	if isFullIteration {
+		return false
+	}
+	_, runtimeInterrupted := errors.AsType[*sobek.InterruptedError](err)
+	return err == nil || runtimeInterrupted || errors.Is(err, context.Canceled)
 }
 
 // iterationInfo returns the identifiers of the current iteration, attached to its span.

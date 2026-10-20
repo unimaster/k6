@@ -10,6 +10,8 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+
+	"go.k6.io/k6/v2/internal/features"
 )
 
 const instrumentationName = "go.k6.io/k6"
@@ -22,17 +24,24 @@ const (
 	SpanIteration = "iteration"
 )
 
-// Tracer returns the tracer of the k6 execution hierarchy spans, or nil when tracing is
-// disabled, i.e. when tp is nil or a noop provider. Callers on hot paths should get the
-// tracer once and keep it, as getting it from the SDK provider takes a global lock.
+// Tracer returns the tracer of the k6 execution hierarchy spans, or nil when they are
+// disabled, i.e. when the native-tracing feature flag isn't enabled, or when tracing is
+// disabled: tp is nil or a noop provider. Callers on hot paths should get the tracer once
+// and keep it, as getting it from the SDK provider takes a global lock.
 //
 // The functions starting the spans of the hierarchy accept a nil tracer, and then return
 // their context unchanged with a noop span.
-func Tracer(tp *TracerProvider) oteltrace.Tracer {
-	if tp == nil || !tp.enabled {
+func Tracer(tp *TracerProvider, flags *features.Flags) oteltrace.Tracer {
+	if !NativeTracingEnabled(flags) || tp == nil || !tp.enabled {
 		return nil
 	}
 	return tp.Tracer(instrumentationName)
+}
+
+// NativeTracingEnabled reports whether the native-tracing feature flag, which gates
+// the k6 execution hierarchy spans, is enabled.
+func NativeTracingEnabled(flags *features.Flags) bool {
+	return flags != nil && flags.NativeTracing
 }
 
 // ScenarioInfo contains the identifiers attached to a scenario span.

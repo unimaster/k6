@@ -141,7 +141,8 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 
 	// testCtx is globalCtx carrying the run span, so that the execution contexts derived
 	// from it below, and the teardown, are part of the test run trace.
-	testCtx, testRun := trace.StartTestRun(globalCtx, trace.Tracer(test.preInitState.TracerProvider), logger)
+	tracer := trace.Tracer(test.preInitState.TracerProvider, test.preInitState.FeatureFlags)
+	testCtx, testRun := trace.StartTestRun(globalCtx, tracer, logger)
 
 	// lingerCtx is cancelled by Ctrl+C, and is used to wait for that event when
 	// k6 was started with the --linger option.

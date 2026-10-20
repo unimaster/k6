@@ -12,6 +12,7 @@ import (
 
 	"go.k6.io/k6/v2/internal/execution"
 	"go.k6.io/k6/v2/internal/execution/local"
+	"go.k6.io/k6/v2/internal/features"
 	"go.k6.io/k6/v2/internal/js"
 	k6trace "go.k6.io/k6/v2/internal/lib/trace"
 	"go.k6.io/k6/v2/internal/lib/trace/tracetest"
@@ -25,6 +26,7 @@ func TestSchedulerTracesScenariosVUsAndIterations(t *testing.T) {
 	tp, rec := tracetest.NewProvider()
 	piState := getTestPreInitState(t)
 	piState.TracerProvider = tp
+	piState.FeatureFlags = &features.Flags{NativeTracing: true}
 
 	sourceData := &loader.SourceData{URL: &url.URL{Path: "/script.js"}, Data: []byte(`
 		export const options = {
@@ -45,7 +47,7 @@ func TestSchedulerTracesScenariosVUsAndIterations(t *testing.T) {
 	require.NoError(t, err)
 
 	// The run span is created outside of the scheduler and carried by the run context.
-	runCtx, runSpan := k6trace.StartTestRun(t.Context(), k6trace.Tracer(tp), testRunState.Logger)
+	runCtx, runSpan := k6trace.StartTestRun(t.Context(), k6trace.Tracer(tp, piState.FeatureFlags), testRunState.Logger)
 
 	samples := make(chan metrics.SampleContainer, 100)
 	go func() {

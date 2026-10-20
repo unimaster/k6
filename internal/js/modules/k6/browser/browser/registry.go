@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/chromium"
@@ -22,6 +23,7 @@ import (
 	"go.k6.io/k6/v2/internal/js/taskqueue"
 
 	k6event "go.k6.io/k6/v2/internal/event"
+	k6trace "go.k6.io/k6/v2/internal/lib/trace"
 	k6modules "go.k6.io/k6/v2/js/modules"
 )
 
@@ -172,8 +174,13 @@ func (r *remoteRegistry) isRemoteBrowser() (string, bool) {
 type browserRegistry struct {
 	vu k6modules.VU
 
-	tracer         *browsertrace.Tracer
-	tracerInit     sync.Once
+	tracer     *browsertrace.Tracer
+	tracerInit sync.Once
+	// nativeTracing is true when the native-tracing feature flag is enabled, then
+	// k6 starts the iteration spans the browser spans are children of. Otherwise, tr holds
+	// the iteration spans the browser module starts itself.
+	nativeTracing  bool
+	tr             *tracesRegistry
 	tracesMetadata map[string]string
 
 	mu sync.RWMutex
@@ -278,7 +285,7 @@ func (r *browserRegistry) handleIterEvents(
 		// script create a browser in any iteration, without options.browser. So we now
 		// process every iteration event and gate only the managed-browser work
 		// (buildFn on IterStart, deleteBrowser on IterEnd) behind isBrowserIter below;
-		// the user-managed-browser sweep (closeUserManaged) runs
+		// the user-managed-browser sweep (closeUserManaged) and endIterationTrace run
 		// unconditionally on IterEnd.
 
 		// The context in the VU is not thread safe. It can
@@ -307,13 +314,12 @@ func (r *browserRegistry) handleIterEvents(
 				break
 			}
 
-			// Because VU.State is nil when browser registry is initialized,
-			// we have to initialize the tracer on the first VU iteration
-			// so we can get access to the k6 TracerProvider.
+			// Wrap the tracer into the VU context to make it accessible for the
+			// other components during the iteration that inherit the VU context.
 			//
-			// The VU context already carries the iteration span started by k6,
-			// so the browser spans are created as its children.
-			tracedCtx := r.withTracer(r.vu.Context())
+			// All browser APIs should work with the vu context, and allow the
+			// k6 iteration control its lifecycle.
+			tracedCtx := r.startIterationTrace(r.vu.Context(), data)
 
 			b, err := r.buildFn(ctx, tracedCtx)
 			if err != nil {
@@ -326,18 +332,14 @@ func (r *browserRegistry) handleIterEvents(
 			}
 			r.setBrowser(data.Iteration, b)
 		case k6event.IterEnd:
-			// Always sweep user-managed browsers, even for non-browser
-			// iterations (connectOverCDP runs in iterations without
-			// options.browser).
+			// Always sweep user-managed browsers and end any iteration trace,
+			// even for non-browser iterations (connectOverCDP runs in
+			// iterations without options.browser).
 			if browserIter {
 				r.deleteBrowser(data.Iteration)
 			}
 			r.closeUserManaged(data.Iteration)
-			// k6 ends the iteration span after the IterEnd event has been handled, so the
-			// navigation spans of the iteration end before it.
-			if r.tracer != nil {
-				r.tracer.EndLiveSpans()
-			}
+			r.endIterationTrace(data.Iteration)
 		default:
 			r.vu.State().Logger.Warnf("received unexpected event type: %v", e.Type)
 		}
@@ -367,6 +369,11 @@ func (r *browserRegistry) handleExitEvent(exitCh <-chan *k6event.Event, unsubscr
 		return
 	}
 	r.clear()
+
+	// Stop traces registry before calling e.Done()
+	// so we avoid a race condition between active spans
+	// being flushed and test exiting
+	r.stopTracesRegistry()
 }
 
 func (r *browserRegistry) setBrowser(id int64, b *common.Browser) {
@@ -478,36 +485,159 @@ func (r *browserRegistry) closeUserManaged(iter int64) {
 // through the VU.State during the iteration execution time span.
 func (r *browserRegistry) initTracer() {
 	// Use a sync.Once so the tracer is only initialized once
-	// per VU, as that is the scope for the browser registry.
+	// per VU, as that is the scope for both browser and traces registry.
 	r.tracerInit.Do(func() {
-		tp := r.vu.State().TracerProvider
+		state := r.vu.State()
+		tp := state.TracerProvider
 		if tp == nil {
 			return
 		}
 		r.tracer = browsertrace.NewTracer(tp, r.tracesMetadata)
+		r.nativeTracing = k6trace.NativeTracingEnabled(state.FeatureFlags)
+		if !r.nativeTracing {
+			r.tr = newTracesRegistry(r.tracer)
+		}
 	})
 }
 
-// withTracer returns ctx wrapping the tracer, so that browser APIs can create their
-// spans as children of the k6 iteration span carried by ctx. It also adds the traces
-// metadata to that iteration span. If tracing is disabled it returns ctx unchanged.
-func (r *browserRegistry) withTracer(ctx context.Context) context.Context {
+// startIterationTrace returns vuCtx wrapping the tracer and the iteration span, so that
+// browser APIs create their spans as children of the iteration span. If tracing is
+// disabled it returns vuCtx unchanged.
+//
+// With the native-tracing feature flag, the iteration span is the one started by k6
+// and carried by vuCtx, the browser only adds the traces metadata to it. Otherwise, the
+// browser starts the iteration span itself, or reuses the one it already started for
+// that iteration, e.g. on a repeat connectOverCDP.
+func (r *browserRegistry) startIterationTrace(vuCtx context.Context, data k6event.IterData) context.Context {
 	r.initTracer()
 	if r.tracer == nil {
-		return ctx
+		return vuCtx
+	}
+
+	tracerCtx := common.WithTracer(vuCtx, r.tracer)
+	if !r.nativeTracing {
+		return r.tr.startIterationTrace(tracerCtx, data)
 	}
 
 	// The iteration span is owned and ended by k6. Setting the same attributes
 	// again, e.g. on repeated connectOverCDP calls, is harmless.
-	r.tracer.AddMetadata(oteltrace.SpanFromContext(ctx))
+	r.tracer.AddMetadata(oteltrace.SpanFromContext(vuCtx))
 
-	return common.WithTracer(ctx, r.tracer)
+	return tracerCtx
+}
+
+// startConnectTrace starts, or reuses, the iteration trace for iter, mirroring the
+// IterStart path used by managed browsers, so browser API calls made over a
+// connectOverCDP browser parent under the iteration trace.
+func (r *browserRegistry) startConnectTrace(vuCtx context.Context, iter int64) context.Context {
+	// Fill in the VU and scenario so connect-only iteration spans carry the
+	// same test.vu/test.scenario attributes as the managed IterStart path.
+	return r.startIterationTrace(vuCtx, k6event.IterData{
+		Iteration:    iter,
+		VUID:         r.vu.State().VUID,
+		ScenarioName: k6ext.GetScenarioName(vuCtx),
+	})
+}
+
+// endIterationTrace ends the trace of iter at IterEnd.
+func (r *browserRegistry) endIterationTrace(iter int64) {
+	switch {
+	case r.tr != nil:
+		r.tr.endIterationTrace(iter)
+	case r.tracer != nil:
+		// k6 ends the iteration span after the IterEnd event has been handled, so the
+		// navigation spans of the iteration end before it.
+		r.tracer.EndLiveSpans()
+	}
+}
+
+func (r *browserRegistry) stopTracesRegistry() {
+	// Because traces registry is initialized on iterStart event, it is not
+	// initialized for the initial NewModuleInstance call, whose VU does not
+	// execute any iteration.
+	if r.tr != nil {
+		r.tr.stop()
+	}
 }
 
 func isBrowserIter(vu k6modules.VU) bool {
 	opts := k6ext.GetScenarioOpts(vu.Context(), vu)
 	_, ok := opts["type"] // Check if browser type option is set
 	return ok
+}
+
+// trace represents a traces registry entry which holds the
+// root span for the trace and a context that wraps that span.
+type trace struct {
+	ctx      context.Context
+	rootSpan oteltrace.Span
+}
+
+// tracesRegistry holds the traces for all iterations of a single VU.
+type tracesRegistry struct {
+	tracer *browsertrace.Tracer
+
+	mu sync.Mutex
+	m  map[int64]*trace
+}
+
+func newTracesRegistry(tracer *browsertrace.Tracer) *tracesRegistry {
+	return &tracesRegistry{
+		tracer: tracer,
+		m:      make(map[int64]*trace),
+	}
+}
+
+func (r *tracesRegistry) startIterationTrace(ctx context.Context, data k6event.IterData) context.Context {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if t, ok := r.m[data.Iteration]; ok {
+		return t.ctx
+	}
+
+	spanCtx, span := r.tracer.Start(ctx, "iteration", oteltrace.WithAttributes(
+		attribute.Int64("test.iteration.number", data.Iteration),
+		attribute.Int64("test.vu", int64(data.VUID)), //nolint:gosec
+		attribute.String("test.scenario", data.ScenarioName),
+	))
+
+	r.m[data.Iteration] = &trace{
+		ctx:      spanCtx,
+		rootSpan: span,
+	}
+
+	return spanCtx
+}
+
+func (r *tracesRegistry) endIterationTrace(iter int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if t, ok := r.m[iter]; ok {
+		t.rootSpan.End()
+		delete(r.m, iter)
+	}
+}
+
+func (r *tracesRegistry) stop() {
+	// End all iteration traces
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for k, v := range r.m {
+		v.rootSpan.End()
+		delete(r.m, k)
+	}
+}
+
+// This is only used in a test. Avoids having to manipulate the mutex in the
+// test itself.
+func (r *tracesRegistry) iterationTracesCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.m)
 }
 
 func parseTracesMetadata(envLookup env.LookupFunc) (map[string]string, error) {

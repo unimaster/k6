@@ -15,6 +15,7 @@ import (
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/k6ext"
 
 	"go.k6.io/k6/v2/internal/event"
+	"go.k6.io/k6/v2/internal/features"
 	"go.k6.io/k6/v2/internal/js/eventloop"
 	k6testutils "go.k6.io/k6/v2/internal/lib/testutils"
 	k6trace "go.k6.io/k6/v2/internal/lib/trace"
@@ -107,10 +108,11 @@ func (v *VU) EndIteration(tb testing.TB, opts ...any) {
 }
 
 // startIterationSpan mimics k6 starting the iteration span and exposing it
-// through the VU context before the IterStart event is emitted.
+// through the VU context before the IterStart event is emitted, which it only
+// does with the native-tracing feature flag.
 func (v *VU) startIterationSpan(data event.IterData) {
 	tp, _ := v.toBeState.TracerProvider.(*k6trace.TracerProvider)
-	tracer := k6trace.Tracer(tp)
+	tracer := k6trace.Tracer(tp, v.toBeState.FeatureFlags)
 	if tracer == nil {
 		return
 	}
@@ -241,12 +243,16 @@ type WithSamples chan k6metrics.SampleContainer
 // WithTracerProvider allows to set the VU TracerProvider.
 type WithTracerProvider lib.TracerProvider
 
+// WithFeatureFlags allows to set the VU feature flags.
+type WithFeatureFlags *features.Flags
+
 // NewVU returns a mock k6 VU.
 //
 // opts can be one of the following:
 //   - WithSamples: a bidirectional channel that will be used to emit metrics.
 //   - env.LookupFunc: a lookup function that will be used to lookup environment variables.
 //   - WithTracerProvider: a TracerProvider that will be set as the VU TracerProvider.
+//   - WithFeatureFlags: the feature flags that will be set as the VU feature flags.
 func NewVU(tb testing.TB, opts ...any) *VU {
 	tb.Helper()
 
@@ -254,6 +260,7 @@ func NewVU(tb testing.TB, opts ...any) *VU {
 		samples                           = make(chan k6metrics.SampleContainer, 1000)
 		lookupFunc                        = env.EmptyLookup
 		tracerProvider lib.TracerProvider = k6trace.NewNoopTracerProvider()
+		featureFlags                      = &features.Flags{}
 	)
 	for _, opt := range opts {
 		switch opt := opt.(type) {
@@ -269,6 +276,8 @@ func NewVU(tb testing.TB, opts ...any) *VU {
 					tracerProvider = k6trace.WrapTracerProvider(sdkTP)
 				}
 			}
+		case WithFeatureFlags:
+			featureFlags = opt
 		}
 	}
 
@@ -321,6 +330,7 @@ func NewVU(tb testing.TB, opts ...any) *VU {
 		),
 		BuiltinMetrics: k6metrics.RegisterBuiltinMetrics(k6metrics.NewRegistry()),
 		TracerProvider: tracerProvider,
+		FeatureFlags:   featureFlags,
 	}
 
 	ctx := k6ext.WithVU(testRT.VU.CtxField, testRT.VU)

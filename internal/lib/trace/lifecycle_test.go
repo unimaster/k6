@@ -13,16 +13,22 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
+	"go.k6.io/k6/v2/internal/features"
 	"go.k6.io/k6/v2/internal/lib/testutils"
 	k6trace "go.k6.io/k6/v2/internal/lib/trace"
 	"go.k6.io/k6/v2/internal/lib/trace/tracetest"
 )
 
+// nativeTracing returns the feature flags enabling the k6 execution hierarchy spans.
+func nativeTracing() *features.Flags {
+	return &features.Flags{NativeTracing: true}
+}
+
 func TestSpanHierarchy(t *testing.T) {
 	t.Parallel()
 
 	tp, rec := tracetest.NewProvider()
-	tracer := k6trace.Tracer(tp)
+	tracer := k6trace.Tracer(tp, nativeTracing())
 	logger := testutils.NewLogger(t)
 
 	runCtx, runSpan := k6trace.StartTestRun(context.Background(), tracer, logger)
@@ -83,7 +89,7 @@ func TestStartTestRunStartsNewTrace(t *testing.T) {
 	outerCtx, outer := tp.Tracer("test").Start(context.Background(), "outer")
 	defer outer.End()
 
-	_, run := k6trace.StartTestRun(outerCtx, k6trace.Tracer(tp), logger)
+	_, run := k6trace.StartTestRun(outerCtx, k6trace.Tracer(tp, nativeTracing()), logger)
 	defer run.End(nil)
 
 	assert.NotEqual(t, outer.SpanContext().TraceID(), run.SpanContext().TraceID())
@@ -93,7 +99,7 @@ func TestTestRunEndsWhenMarkedFinished(t *testing.T) {
 	t.Parallel()
 
 	tp, rec := tracetest.NewProvider()
-	_, run := k6trace.StartTestRun(context.Background(), k6trace.Tracer(tp), testutils.NewLogger(t))
+	_, run := k6trace.StartTestRun(context.Background(), k6trace.Tracer(tp, nativeTracing()), testutils.NewLogger(t))
 
 	run.MarkFinished()
 	finished := time.Now()
@@ -112,7 +118,7 @@ func TestTestRunEndsOnce(t *testing.T) {
 	t.Parallel()
 
 	tp, rec := tracetest.NewProvider()
-	_, run := k6trace.StartTestRun(context.Background(), k6trace.Tracer(tp), testutils.NewLogger(t))
+	_, run := k6trace.StartTestRun(context.Background(), k6trace.Tracer(tp, nativeTracing()), testutils.NewLogger(t))
 
 	// A hard stop and the end of the run can both end the run span, concurrently.
 	var wg sync.WaitGroup
@@ -155,7 +161,7 @@ func TestEndSpanRecordsError(t *testing.T) {
 	t.Parallel()
 
 	tp, rec := tracetest.NewProvider()
-	tracer := k6trace.Tracer(tp)
+	tracer := k6trace.Tracer(tp, nativeTracing())
 	_, okSpan := k6trace.StartScenario(context.Background(), tracer, k6trace.ScenarioInfo{Name: "ok"})
 	k6trace.EndSpan(okSpan, nil)
 	_, failSpan := k6trace.StartScenario(context.Background(), tracer, k6trace.ScenarioInfo{Name: "fail"})
@@ -174,19 +180,28 @@ func TestTracerIsNilWhenTracingIsDisabled(t *testing.T) {
 	t.Parallel()
 
 	var nilProvider *k6trace.TracerProvider
-	assert.Nil(t, k6trace.Tracer(nil))
-	assert.Nil(t, k6trace.Tracer(nilProvider))
-	assert.Nil(t, k6trace.Tracer(k6trace.NewNoopTracerProvider()))
+	assert.Nil(t, k6trace.Tracer(nil, nativeTracing()))
+	assert.Nil(t, k6trace.Tracer(nilProvider, nativeTracing()))
+	assert.Nil(t, k6trace.Tracer(k6trace.NewNoopTracerProvider(), nativeTracing()))
 
 	tp, _ := tracetest.NewProvider()
-	assert.NotNil(t, k6trace.Tracer(tp))
+	assert.NotNil(t, k6trace.Tracer(tp, nativeTracing()))
+}
+
+func TestTracerIsGatedByTheFeatureFlag(t *testing.T) {
+	t.Parallel()
+
+	tp, _ := tracetest.NewProvider()
+	assert.Nil(t, k6trace.Tracer(tp, nil))
+	assert.Nil(t, k6trace.Tracer(tp, &features.Flags{}))
+	assert.NotNil(t, k6trace.Tracer(tp, &features.Flags{NativeTracing: true}))
 }
 
 func TestEndIterationDoesNotRecordInterruptionsAsErrors(t *testing.T) {
 	t.Parallel()
 
 	tp, rec := tracetest.NewProvider()
-	tracer := k6trace.Tracer(tp)
+	tracer := k6trace.Tracer(tp, nativeTracing())
 	_, failed := k6trace.StartIteration(context.Background(), tracer, k6trace.IterationInfo{Number: 0})
 	k6trace.EndIteration(failed, errors.New("boom"), false)
 	_, interrupted := k6trace.StartIteration(context.Background(), tracer, k6trace.IterationInfo{Number: 1})
@@ -204,7 +219,7 @@ func TestIterationWithoutScenarioIterationNumbers(t *testing.T) {
 	t.Parallel()
 
 	tp, rec := tracetest.NewProvider()
-	_, span := k6trace.StartIteration(context.Background(), k6trace.Tracer(tp), k6trace.IterationInfo{Number: 1})
+	_, span := k6trace.StartIteration(context.Background(), k6trace.Tracer(tp, nativeTracing()), k6trace.IterationInfo{Number: 1})
 	span.End()
 
 	for _, kv := range rec.Ended()[0].Attributes() {

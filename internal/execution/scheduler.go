@@ -368,7 +368,7 @@ func (e *Scheduler) runExecutor(
 	)
 
 	scenarioCtx, scenarioSpan := k6trace.StartScenario(
-		runCtx, k6trace.Tracer(e.state.Test.TracerProvider), k6trace.ScenarioInfo{
+		runCtx, k6trace.Tracer(e.state.Test.TracerProvider, e.state.Test.FeatureFlags), k6trace.ScenarioInfo{
 			Name:     executorConfig.GetName(),
 			Executor: executorConfig.GetType(),
 		},
