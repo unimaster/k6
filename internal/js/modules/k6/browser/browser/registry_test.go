@@ -14,10 +14,8 @@ import (
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/common"
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/env"
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/k6ext/k6test"
-	k6trace "go.k6.io/k6/v2/internal/lib/trace"
 
 	k6event "go.k6.io/k6/v2/internal/event"
-	"go.k6.io/k6/v2/internal/features"
 )
 
 func TestPidRegistry(t *testing.T) {
@@ -324,8 +322,9 @@ func TestBrowserRegistry(t *testing.T) {
 
 	// IterEnd must be a no-op for a non-browser iteration that never called
 	// chromium.connectOverCDP: nothing was built (IterStart is skipped), nothing
-	// is tracked in userManaged, and the tracer was never initialized.
-	// This locks in the unconditional closeUserManaged sweep on IterEnd.
+	// is tracked in userManaged, and the traces registry was never initialized.
+	// This locks in the `if r.tr != nil` guard and the unconditional
+	// closeUserManaged sweep on IterEnd — without them, IterEnd would panic here.
 	t.Run("iterend_noop_on_bare_non_browser_iter", func(t *testing.T) {
 		t.Parallel()
 
@@ -341,25 +340,23 @@ func TestBrowserRegistry(t *testing.T) {
 
 		vu.StartIteration(t, k6test.WithIteration(0))
 
-		// Nothing built and no tracer: IterStart is skipped entirely for
-		// a non-browser iter, and connectOverCDP (which would init the tracer)
+		// Nothing built and no traces registry: IterStart is skipped entirely for
+		// a non-browser iter, and connectOverCDP (which would init the registry)
 		// was never called.
 		require.Equal(t, 0, browserRegistry.browserCount())
-		require.Nil(t, browserRegistry.tracer, "tracer must not be initialized for a bare non-browser iter")
+		require.Nil(t, browserRegistry.tr, "traces registry must not be initialized for a bare non-browser iter")
 
 		// The regression under test: IterEnd reaches closeUserManaged (nothing
-		// tracked). It must not panic.
+		// tracked) and the trace guard (r.tr is nil). Neither may panic.
 		require.NotPanics(t, func() {
 			vu.EndIteration(t, k6test.WithIteration(0))
 		})
 
 		require.Equal(t, 0, browserRegistry.browserCount())
-		require.Nil(t, browserRegistry.tracer, "tracer must remain uninitialized after IterEnd")
+		require.Nil(t, browserRegistry.tr, "traces registry must remain uninitialized after IterEnd")
 	})
 }
 
-// TestStartConnectTraceAttributes verifies that, without the native-tracing feature
-// flag, the browser module starts the iteration span itself.
 func TestStartConnectTraceAttributes(t *testing.T) {
 	t.Parallel()
 
@@ -370,7 +367,6 @@ func TestStartConnectTraceAttributes(t *testing.T) {
 	vu.ActivateVU()
 	vu.StartIteration(t)
 	vu.State().VUID = 42 // non-zero so the test.vu assertion is meaningful
-	require.Equal(t, 0, rec.Len(), "k6 doesn't start the iteration span without the feature flag")
 
 	r := &browserRegistry{
 		vu:          vu,
@@ -378,98 +374,11 @@ func TestStartConnectTraceAttributes(t *testing.T) {
 		userManaged: make(map[int64][]*common.Browser),
 	}
 	r.startConnectTrace(vu.Context(), vu.State().Iteration)
-	// Connecting again in the same iteration reuses the iteration span.
-	r.startConnectTrace(vu.Context(), vu.State().Iteration)
 
 	span, ok := rec.Find("iteration")
 	require.True(t, ok, "expected an 'iteration' root span")
-	require.Equal(t, 1, rec.Len())
 	require.Equal(t, int64(42), span.AttrInt64(t, "test.vu"))
 	require.Equal(t, "default", span.AttrString(t, "test.scenario"))
-}
-
-func TestTracesMetadataOnIterationSpan(t *testing.T) {
-	t.Parallel()
-
-	rec := k6test.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
-
-	vu := k6test.NewVU(t, k6test.WithTracerProvider(tp), nativeTracing())
-	vu.ActivateVU()
-	vu.StartIteration(t)
-	iterSpan, ok := rec.Find(k6trace.SpanIteration)
-	require.True(t, ok, "the k6test VU starts the iteration span, as k6 does")
-
-	r := &browserRegistry{
-		vu:             vu,
-		tracesMetadata: map[string]string{"meta": "value"},
-		m:              make(map[int64]*common.Browser),
-		userManaged:    make(map[int64][]*common.Browser),
-	}
-	ctx := r.startConnectTrace(vu.Context(), vu.State().Iteration)
-	// Connecting again in the same iteration must not change anything either.
-	r.startConnectTrace(vu.Context(), vu.State().Iteration)
-	require.Equal(t, 1, rec.Len(), "the browser must not start spans of its own to trace an iteration")
-
-	// The spans of the browser APIs are children of the k6 iteration span.
-	tracer := common.GetTracer(ctx)
-	require.NotNil(t, tracer, "tracer must be wired into the context")
-	_, apiSpan := tracer.TraceAPICall(ctx, "target", "browser.newPage")
-	apiSpan.End()
-	newPage, ok := rec.Find("browser.newPage")
-	require.True(t, ok)
-	require.Equal(t, iterSpan.SpanID, newPage.ParentID)
-	require.Equal(t, iterSpan.TraceID, newPage.TraceID)
-
-	// The browser registry adds the metadata to the k6 iteration span.
-	vu.EndIteration(t)
-	iterSpan, _ = rec.Find(k6trace.SpanIteration)
-	require.Equal(t, "value", iterSpan.AttrString(t, "meta"))
-	require.Equal(t, "default", iterSpan.AttrString(t, "test.scenario"))
-}
-
-func TestLiveNavigationSpansEndWithTheIteration(t *testing.T) {
-	t.Parallel()
-
-	rec := k6test.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
-
-	remoteRegistry, err := newRemoteRegistry(func(string) (string, bool) { return "", false })
-	require.NoError(t, err)
-	vu := k6test.NewVU(t, k6test.WithTracerProvider(tp), nativeTracing())
-	r := newBrowserRegistry(context.Background(), vu, remoteRegistry, &pidRegistry{}, nil)
-	vu.ActivateVU()
-
-	// A non-browser iteration, so no browser is launched; connectOverCDP initializes the tracer.
-	delete(vu.StateField.Options.Scenarios["default"].GetScenarioOptions().Browser, "type")
-	vu.StartIteration(t, k6test.WithIteration(0))
-	ctx := r.startConnectTrace(vu.Context(), 0)
-	tracer := common.GetTracer(ctx)
-	_, navSpan := tracer.TraceNavigation(ctx, "target")
-	navSpanID := navSpan.SpanContext().SpanID()
-	require.False(t, rec.IsEnded(navSpanID))
-
-	// While the navigation is live, its events are traced under it.
-	_, during := tracer.TraceEvent(ctx, "target", "web_vital", navSpanID.String())
-	require.True(t, during.SpanContext().IsValid())
-	during.End()
-
-	vu.EndIteration(t, k6test.WithIteration(0))
-
-	require.True(t, rec.IsEnded(navSpanID), "the last navigation span of the iteration must end with it")
-
-	// Late events of that navigation, e.g. web vitals parsed asynchronously, are dropped
-	// instead of being attached to an ended span.
-	recorded := rec.Len()
-	_, late := tracer.TraceEvent(ctx, "target", "web_vital", navSpanID.String())
-	assert.False(t, late.SpanContext().IsValid())
-	assert.Equal(t, recorded, rec.Len(), "no span is started for a late event")
-}
-
-// nativeTracing returns the k6test VU option enabling the native-tracing feature
-// flag, with which k6 starts the iteration spans.
-func nativeTracing() k6test.WithFeatureFlags {
-	return &features.Flags{NativeTracing: true}
 }
 
 func TestParseTracesMetadata(t *testing.T) {

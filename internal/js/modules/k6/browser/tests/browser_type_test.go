@@ -2,14 +2,12 @@ package tests
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	k6event "go.k6.io/k6/v2/internal/event"
-	"go.k6.io/k6/v2/internal/features"
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/browser"
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/chromium"
 	"go.k6.io/k6/v2/internal/js/modules/k6/browser/env"
@@ -207,58 +205,49 @@ func TestChromiumConnectOverCDPExitSweep(t *testing.T) {
 }
 
 // TestChromiumConnectOverCDPTraceLinkage verifies that a call made over a
-// connectOverCDP browser produces a span parented under the iteration span,
-// keyed by the real iteration number, and that span is ended at IterEnd.
-// With the native-tracing feature flag the iteration span is started by
-// k6, otherwise by the browser module.
+// connectOverCDP browser produces a span parented under an iteration root
+// span keyed by the real iteration number, and that root span is
+// ended at IterEnd.
 // It uses a recording tracer provider to inspect the span tree.
 func TestChromiumConnectOverCDPTraceLinkage(t *testing.T) {
 	t.Parallel()
 
-	for _, nativeTracing := range []bool{false, true} {
-		t.Run(fmt.Sprintf("native_tracing=%t", nativeTracing), func(t *testing.T) {
-			t.Parallel()
+	rec := k6test.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
 
-			rec := k6test.NewSpanRecorder()
-			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	tb := newTestBrowser(t)
+	vu := setupChromiumVU(t, k6test.WithTracerProvider(tp))
+	wantIter := vu.State().Iteration
 
-			tb := newTestBrowser(t)
-			vu := setupChromiumVU(t,
-				k6test.WithTracerProvider(tp),
-				k6test.WithFeatureFlags(&features.Flags{NativeTracing: nativeTracing}),
-			)
-			wantIter := vu.State().Iteration
+	_, err := vu.RunAsync(t, `
+		const b = await chromium.connectOverCDP("%s");
+		const p = await b.newPage();
+		await p.close();
+		await b.close();
+	`, tb.wsURL)
+	require.NoError(t, err)
 
-			_, err := vu.RunAsync(t, `
-				const b = await chromium.connectOverCDP("%s");
-				const p = await b.newPage();
-				await p.close();
-				await b.close();
-			`, tb.wsURL)
-			require.NoError(t, err)
+	// End the iteration so the iteration root span is closed.
+	vu.EndIteration(t)
 
-			// End the iteration so the iteration span is closed.
-			vu.EndIteration(t)
+	iterSpan, ok := rec.Find("iteration")
+	require.True(t, ok, "expected an 'iteration' root span")
+	newPageSpan, ok := rec.Find("browser.newPage")
+	require.True(t, ok, "expected a 'browser.newPage' span")
 
-			iterSpan, ok := rec.Find("iteration")
-			require.True(t, ok, "expected an 'iteration' span")
-			newPageSpan, ok := rec.Find("browser.newPage")
-			require.True(t, ok, "expected a 'browser.newPage' span")
+	// The browser API span must be parented under the iteration trace that
+	// connectOverCDP established. If startConnectTrace did not wire the tracer
+	// into the browser's context, browser.newPage would be a noop/orphaned span
+	// and these assertions would fail.
+	require.Equal(t, iterSpan.TraceID, newPageSpan.TraceID,
+		"browser.newPage span should be in the same trace as the iteration span")
+	require.Equal(t, iterSpan.SpanID, newPageSpan.ParentID,
+		"browser.newPage span should be parented under the iteration span")
 
-			// The browser API span must be parented under the iteration span. If
-			// startConnectTrace did not wire the tracer into the browser's context,
-			// browser.newPage would be a noop/orphaned span and these assertions would fail.
-			require.Equal(t, iterSpan.TraceID, newPageSpan.TraceID,
-				"browser.newPage span should be in the same trace as the iteration span")
-			require.Equal(t, iterSpan.SpanID, newPageSpan.ParentID,
-				"browser.newPage span should be parented under the iteration span")
-
-			// The iteration span must be keyed by the real iteration number and ended
-			// when the iteration ends.
-			require.Equal(t, wantIter, iterSpan.AttrInt64(t, "test.iteration.number"))
-			require.True(t, rec.IsEnded(iterSpan.SpanID), "iteration span should be ended at IterEnd")
-		})
-	}
+	// The iteration span must be keyed by the real iteration number and ended
+	// when the iteration ends.
+	require.Equal(t, wantIter, iterSpan.AttrInt64(t, "test.iteration.number"))
+	require.True(t, rec.IsEnded(iterSpan.SpanID), "iteration span should be ended at IterEnd")
 }
 
 func TestBrowserTypeLaunchToConnect(t *testing.T) {
