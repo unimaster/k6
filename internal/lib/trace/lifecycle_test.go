@@ -215,6 +215,29 @@ func TestEndIterationDoesNotRecordInterruptionsAsErrors(t *testing.T) {
 	assert.Contains(t, spans[1].Attributes(), attribute.Bool("k6.iteration.interrupted", true))
 }
 
+func TestMarkIterationFailed(t *testing.T) {
+	t.Parallel()
+
+	tp, rec := tracetest.NewProvider()
+	tracer := k6trace.Tracer(tp, nativeTracing())
+
+	// Outside of an iteration, e.g. in setup, it does nothing.
+	k6trace.MarkIterationFailed(context.Background(), "failed")
+
+	ctx, iteration := k6trace.StartIteration(context.Background(), tracer, k6trace.IterationInfo{Number: 0})
+	// The iteration span is found even when a module made a child span the active one.
+	childCtx, child := tracer.Start(ctx, "child")
+	k6trace.MarkIterationFailed(childCtx, "test marked as failed: oops")
+	child.End()
+	k6trace.EndIteration(iteration, nil, false)
+
+	spans := rec.Ended()
+	require.Len(t, spans, 2)
+	assert.Equal(t, codes.Unset, spans[0].Status().Code)
+	assert.Equal(t, codes.Error, spans[1].Status().Code)
+	assert.Equal(t, "test marked as failed: oops", spans[1].Status().Description)
+}
+
 func TestIterationWithoutScenarioIterationNumbers(t *testing.T) {
 	t.Parallel()
 

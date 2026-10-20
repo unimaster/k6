@@ -55,10 +55,6 @@ const (
 	// This timeout should be long enough to flush all remaining traces, but still
 	// provides a safeguard to not block indefinitely.
 	waitForTracerProviderStopTimeout = 3 * time.Minute
-
-	// On a hard stop, e.g. a second Ctrl+C, k6 must exit promptly, so it only gives the
-	// tracer provider a short time to export the spans that have ended.
-	waitForTracerProviderStopOnHardStopTimeout = 3 * time.Second
 )
 
 // TODO: split apart some more
@@ -428,10 +424,6 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	}
 	onHardStop := func(sig os.Signal) {
 		logger.WithField("sig", sig).Error("Aborting k6 in response to signal")
-		// k6 exits right after this, without running the deferred functions, so this is the
-		// last chance to export the run span and the spans that have already ended.
-		testRun.End(fmt.Errorf("test run was aborted because k6 received a second '%s' signal", sig))
-		shutdownTracerProvider(waitForTracerProviderStopOnHardStopTimeout)
 		globalCancel() // not that it matters, given that os.Exit() will be called right after
 	}
 	stopSignalHandling := handleTestAbortSignals(c.gs, gracefulStop, onHardStop)

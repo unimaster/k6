@@ -969,13 +969,13 @@ func (u *ActiveVU) loadSetupData() error {
 	return nil
 }
 
-// isInterrupted reports whether an iteration was interrupted rather than failed: the script
-// aborted the test, which only interrupts the runtime, or its context was done, e.g. at the
-// end of its scenario, and it didn't fail otherwise, e.g. with an exception thrown right
-// before the interruption.
+// isInterrupted reports whether an iteration was interrupted rather than failed: its context
+// was done, e.g. at the end of its scenario, and it didn't fail otherwise, e.g. with an
+// exception thrown right before the interruption. An iteration aborting the test, e.g. with
+// test.abort(), failed.
 func isInterrupted(isFullIteration bool, err error) bool {
 	if _, aborted := errors.AsType[*errext.InterruptError](err); aborted {
-		return true
+		return false
 	}
 	if isFullIteration {
 		return false

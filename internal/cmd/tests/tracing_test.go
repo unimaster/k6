@@ -5,13 +5,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"os/exec"
 	"slices"
 	"sync"
-	"syscall"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -161,6 +158,35 @@ func TestTracesOutputRecordsIterationErrors(t *testing.T) {
 	assert.Contains(t, iterations[0].GetStatus().GetMessage(), "boom")
 }
 
+func TestTracesOutputRecordsIterationsMarkingTheTestAsFailed(t *testing.T) {
+	t.Parallel()
+
+	collector, endpoint := newOTLPCollector(t)
+	script := `
+		import exec from 'k6/execution';
+		export const options = { iterations: 2 };
+		export default function () {
+			if (exec.scenario.iterationInTest === 0) {
+				exec.test.fail('oops');
+			}
+		}
+	`
+	ts := getSingleFileTestState(t, script, []string{nativeTracingFlag, "--traces-output=otel=" + endpoint}, exitcodes.MarkedAsFailed)
+	cmd.ExecuteWithGlobalState(ts.GlobalState)
+
+	// Only the iteration calling test.fail() failed, the test goes on.
+	iterations := collector.byName("iteration")
+	require.Len(t, iterations, 2)
+	var failed []*tracepb.Span
+	for _, s := range iterations {
+		if s.GetStatus().GetCode() == tracepb.Status_STATUS_CODE_ERROR {
+			failed = append(failed, s)
+		}
+	}
+	require.Len(t, failed, 1)
+	assert.Contains(t, failed[0].GetStatus().GetMessage(), "oops")
+}
+
 func TestTracesOutputRecordsRunFailure(t *testing.T) {
 	t.Parallel()
 
@@ -177,79 +203,12 @@ func TestTracesOutputRecordsRunFailure(t *testing.T) {
 	assert.Equal(t, tracepb.Status_STATUS_CODE_ERROR, runs[0].GetStatus().GetCode())
 	assert.Contains(t, runs[0].GetStatus().GetMessage(), "stop")
 
-	// The aborted iteration is interrupted, the error belongs to the run.
+	// The iteration aborting the test failed.
 	iterations := collector.byName("iteration")
 	require.Len(t, iterations, 1)
-	assert.Equal(t, tracepb.Status_STATUS_CODE_UNSET, iterations[0].GetStatus().GetCode())
-	assert.True(t, hasBoolAttribute(iterations[0], "k6.iteration.interrupted"))
-}
-
-func TestTracesOutputExportsTheRunSpanOnHardStop(t *testing.T) {
-	t.Parallel()
-
-	collector, endpoint := newOTLPCollector(t)
-	script := `
-		import { sleep } from 'k6';
-		export const options = { iterations: 1 };
-		export default function () {}
-		// The first signal doesn't interrupt the teardown, the second one hard stops k6.
-		export function teardown() {
-			console.log('teardown started');
-			sleep(60);
-		}
-	`
-	ts := getSingleFileTestState(t, script, []string{
-		"-v", "--log-output=stdout", nativeTracingFlag, "--traces-output=otel=" + endpoint,
-	}, exitcodes.ExternalAbort)
-
-	sendSignal := make(chan os.Signal)
-	ts.SignalNotify = func(c chan<- os.Signal, signals ...os.Signal) {
-		if !slices.Contains(signals, os.Interrupt) {
-			return
-		}
-		go func() {
-			for sig := range sendSignal {
-				c <- sig
-			}
-		}()
-	}
-	ts.SignalStop = func(chan<- os.Signal) {}
-
-	// k6 doesn't run its deferred functions after a hard stop, as it exits right away, so
-	// the run span must have been exported by the time os.Exit is called.
-	var (
-		mu        sync.Mutex
-		runAtExit []*tracepb.Span
-		exited    bool
-	)
-	osExit := ts.OSExit
-	ts.OSExit = func(code int) {
-		mu.Lock()
-		defer mu.Unlock()
-		// The mock doesn't exit, so k6 later calls it again at the end of the command. Only
-		// the first call, by the hard stop, would happen in a real process.
-		if exited {
-			return
-		}
-		exited = true
-		runAtExit = collector.byName("k6.run")
-		osExit(code)
-	}
-
-	asyncWaitForStdoutAndRun(t, ts, 50, 100*time.Millisecond, "teardown started", func() {
-		sendSignal <- syscall.SIGINT
-		sendSignal <- syscall.SIGINT
-		close(sendSignal)
-	})
-	cmd.ExecuteWithGlobalState(ts.GlobalState)
-
-	mu.Lock()
-	defer mu.Unlock()
-	require.True(t, exited, "k6 must have hard stopped")
-	require.Len(t, runAtExit, 1)
-	assert.Equal(t, tracepb.Status_STATUS_CODE_ERROR, runAtExit[0].GetStatus().GetCode())
-	assert.Contains(t, runAtExit[0].GetStatus().GetMessage(), "second")
-	assert.Len(t, collector.byName("iteration"), 1, "the spans already ended are exported too")
+	assert.Equal(t, tracepb.Status_STATUS_CODE_ERROR, iterations[0].GetStatus().GetCode())
+	assert.Contains(t, iterations[0].GetStatus().GetMessage(), "stop")
+	assert.False(t, hasBoolAttribute(iterations[0], "k6.iteration.interrupted"))
 }
 
 func hasBoolAttribute(span *tracepb.Span, key string) bool {

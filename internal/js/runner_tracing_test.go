@@ -247,7 +247,8 @@ func TestIsInterrupted(t *testing.T) {
 	}{
 		{name: "full iteration", isFullIteration: true, want: false},
 		{name: "full iteration with an error", isFullIteration: true, err: errors.New("boom"), want: false},
-		{name: "test aborted", isFullIteration: true, err: &errext.InterruptError{}, want: true},
+		{name: "test aborted", isFullIteration: true, err: &errext.InterruptError{}, want: false},
+		{name: "test aborted, context done", err: &errext.InterruptError{}, want: false},
 		{name: "context done", want: true},
 		{name: "context done, runtime interrupted", err: &sobek.InterruptedError{}, want: true},
 		{name: "context done, canceled", err: fmt.Errorf("op: %w", context.Canceled), want: true},

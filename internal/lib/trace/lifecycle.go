@@ -2,6 +2,7 @@ package trace
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -92,7 +93,7 @@ func StartTestRun(
 		return ctx, &TestRun{span: noop.Span{}}
 	}
 	ctx, span := tracer.Start(ctx, SpanRun, oteltrace.WithNewRoot())
-	logger.Info("Tracing the test run")
+	logger.WithField("trace_id", span.SpanContext().TraceID().String()).Debug("Tracing the test run")
 	return ctx, &TestRun{span: span}
 }
 
@@ -176,11 +177,28 @@ func StartIteration(
 			uint64Attribute("k6.scenario.iteration_in_test", info.ScenarioIterationInTest),
 		)
 	}
-	return tracer.Start(ctx, SpanIteration, oteltrace.WithAttributes(attrs...))
+	ctx, span := tracer.Start(ctx, SpanIteration, oteltrace.WithAttributes(attrs...))
+	return context.WithValue(ctx, iterationSpanKey{}, span), span
+}
+
+// iterationSpanKey is the context key of the iteration span. It is kept apart from the active
+// span, as the modules can create child spans, so the iteration span can still be found.
+type iterationSpanKey struct{}
+
+// MarkIterationFailed records reason as an error on the iteration span in ctx, e.g. when the
+// script calls test.fail(). It does nothing when ctx has no iteration span, e.g. in setup, or
+// when the iteration span has already ended.
+func MarkIterationFailed(ctx context.Context, reason string) {
+	span, ok := ctx.Value(iterationSpanKey{}).(oteltrace.Span)
+	if !ok {
+		return
+	}
+	span.RecordError(errors.New(reason))
+	span.SetStatus(codes.Error, reason)
 }
 
 // EndIteration ends an iteration span. An interrupted iteration, e.g. by the end of its
-// scenario or by a test abort, is flagged as such instead of being recorded as an error, as
+// scenario, is flagged as such instead of being recorded as an error, as
 // it is expected for iterations to be interrupted at the end of a test.
 func EndIteration(span oteltrace.Span, err error, interrupted bool) {
 	if interrupted {
