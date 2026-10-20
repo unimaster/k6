@@ -100,45 +100,43 @@ func TestIterationSpanIsInTheVUContext(t *testing.T) {
 	assert.Equal(t, iterations[0].SpanContext().SpanID(), (<-seen).SpanID())
 }
 
-func TestNoSpansWithoutTracerProvider(t *testing.T) {
-	t.Parallel()
-
-	r, err := getSimpleRunner(t, "/script.js", `exports.default = function() {}`)
-	require.NoError(t, err)
-	require.Nil(t, r.preInitState.TracerProvider)
-
-	samples := make(chan metrics.SampleContainer, 100)
-	defer close(samples)
-
-	vu, err := r.newVU(t.Context(), 1, 1, samples)
-	require.NoError(t, err)
-	assert.Nil(t, vu.tracer)
-	seen := spanContextOnIterStart(vu)
-	require.NoError(t, vu.Activate(&lib.VUActivationParams{RunContext: t.Context()}).RunOnce())
-	assert.False(t, (<-seen).IsValid(), "no iteration span in the VU context during the iteration")
-}
-
-func TestNoSpansWithoutNativeTracingFeatureFlag(t *testing.T) {
+func TestNoSpansWhenNativeTracingIsDisabled(t *testing.T) {
 	t.Parallel()
 
 	tp, rec := tracetest.NewProvider()
-	r, err := getSimpleRunner(t, "/script.js", `exports.default = function() {}`)
-	require.NoError(t, err)
-	r.preInitState.TracerProvider = tp
-	require.False(t, k6trace.NativeTracingEnabled(r.preInitState.FeatureFlags))
+	// Cleanup runs once the parallel subtests are done.
+	t.Cleanup(func() { assert.Empty(t, rec.Ended()) })
+	tests := []struct {
+		name  string
+		tp    *k6trace.TracerProvider
+		flags *features.Flags
+	}{
+		{name: "no tracer provider", flags: nativeTracing()},
+		{name: "noop tracer provider", tp: k6trace.NewNoopTracerProvider(), flags: nativeTracing()},
+		{name: "no feature flag", tp: tp},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	samples := make(chan metrics.SampleContainer, 100)
-	defer close(samples)
+			r, err := getSimpleRunner(t, "/script.js", `exports.default = function() {}`)
+			require.NoError(t, err)
+			r.preInitState.TracerProvider = tc.tp
+			r.preInitState.FeatureFlags = tc.flags
 
-	vu, err := r.newVU(t.Context(), 1, 1, samples)
-	require.NoError(t, err)
-	assert.Nil(t, vu.tracer, "no spans are started on the hot path without the feature flag")
-	seen := spanContextOnIterStart(vu)
-	runCtx, cancel := context.WithCancel(t.Context())
-	require.NoError(t, vu.Activate(&lib.VUActivationParams{RunContext: runCtx}).RunOnce())
-	assert.False(t, (<-seen).IsValid(), "no iteration span in the VU context during the iteration")
-	cancel()
-	assert.Empty(t, rec.Ended())
+			samples := make(chan metrics.SampleContainer, 100)
+			defer close(samples)
+
+			vu, err := r.newVU(t.Context(), 1, 1, samples)
+			require.NoError(t, err)
+			assert.Nil(t, vu.tracer, "no spans are started on the hot path when native tracing is disabled")
+			seen := spanContextOnIterStart(vu)
+			runCtx, cancel := context.WithCancel(t.Context())
+			require.NoError(t, vu.Activate(&lib.VUActivationParams{RunContext: runCtx}).RunOnce())
+			assert.False(t, (<-seen).IsValid(), "no iteration span in the VU context during the iteration")
+			cancel()
+		})
+	}
 }
 
 func TestInterruptedIterationSpanIsNotAnError(t *testing.T) {
@@ -180,25 +178,6 @@ func TestInterruptedIterationSpanIsNotAnError(t *testing.T) {
 	assert.Equal(t, codes.Unset, iterations[0].Status().Code)
 	assert.Empty(t, iterations[0].Events())
 	assert.Contains(t, iterations[0].Attributes(), attribute.Bool("k6.iteration.interrupted", true))
-}
-
-func TestNoTracerWithNoopTracerProvider(t *testing.T) {
-	t.Parallel()
-
-	r, err := getSimpleRunner(t, "/script.js", `exports.default = function() {}`)
-	require.NoError(t, err)
-	r.preInitState.TracerProvider = k6trace.NewNoopTracerProvider()
-	r.preInitState.FeatureFlags = nativeTracing()
-
-	samples := make(chan metrics.SampleContainer, 100)
-	defer close(samples)
-
-	vu, err := r.newVU(t.Context(), 1, 1, samples)
-	require.NoError(t, err)
-	assert.Nil(t, vu.tracer, "no spans are started on the hot path when tracing is disabled")
-	seen := spanContextOnIterStart(vu)
-	require.NoError(t, vu.Activate(&lib.VUActivationParams{RunContext: t.Context()}).RunOnce())
-	assert.False(t, (<-seen).IsValid(), "no iteration span in the VU context during the iteration")
 }
 
 func TestIterationSpanIsOnlyInTheVUContextDuringTheIteration(t *testing.T) {

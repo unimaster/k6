@@ -136,6 +136,7 @@ func TestTracesOutputExportsRunHierarchy(t *testing.T) {
 	}
 	for _, s := range iterations {
 		assert.Equal(t, "vu", ids[string(s.GetParentSpanId())])
+		assert.True(t, hasAttribute(s, "k6.scenario.iteration_in_test"), "executors provide the scenario iteration counters")
 	}
 }
 
@@ -209,6 +210,15 @@ func TestTracesOutputRecordsRunFailure(t *testing.T) {
 	assert.Equal(t, tracepb.Status_STATUS_CODE_ERROR, iterations[0].GetStatus().GetCode())
 	assert.Contains(t, iterations[0].GetStatus().GetMessage(), "stop")
 	assert.False(t, hasBoolAttribute(iterations[0], "k6.iteration.interrupted"))
+}
+
+func hasAttribute(span *tracepb.Span, key string) bool {
+	for _, kv := range span.GetAttributes() {
+		if kv.GetKey() == key {
+			return true
+		}
+	}
+	return false
 }
 
 func hasBoolAttribute(span *tracepb.Span, key string) bool {

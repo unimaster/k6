@@ -3,8 +3,6 @@ package trace
 import (
 	"context"
 	"errors"
-	"sync"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
@@ -75,59 +73,16 @@ type IterationInfo struct {
 	HasScenarioIterationNumbers bool
 }
 
-// TestRun is the span of a test run. It can be ended from different goroutines, e.g. at the
-// end of the run or on a hard stop, only the first End is recorded.
-type TestRun struct {
-	span    oteltrace.Span
-	endOnce sync.Once
-
-	mu         sync.Mutex
-	finishedAt time.Time
-}
-
 // StartTestRun starts the span of a test run, the root of a new trace.
 func StartTestRun(
 	ctx context.Context, tracer oteltrace.Tracer, logger logrus.FieldLogger,
-) (context.Context, *TestRun) {
+) (context.Context, oteltrace.Span) {
 	if tracer == nil {
-		return ctx, &TestRun{span: noop.Span{}}
+		return ctx, noop.Span{}
 	}
 	ctx, span := tracer.Start(ctx, SpanRun, oteltrace.WithNewRoot())
 	logger.WithField("trace_id", span.SpanContext().TraceID().String()).Debug("Tracing the test run")
-	return ctx, &TestRun{span: span}
-}
-
-// SpanContext returns the span context of the run span.
-func (r *TestRun) SpanContext() oteltrace.SpanContext {
-	return r.span.SpanContext()
-}
-
-// MarkFinished records that the test execution, including the teardown, has finished. The
-// run span ends at that time, so what follows, e.g. the end-of-test summary or the --linger
-// wait, isn't part of it, while its status can still reflect the final result of the test,
-// e.g. crossed thresholds, which is only known later.
-func (r *TestRun) MarkFinished() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.finishedAt.IsZero() {
-		r.finishedAt = time.Now()
-	}
-}
-
-// End records err on the run span, when present, and ends it at the time MarkFinished was
-// called, or now if it wasn't.
-func (r *TestRun) End(err error) {
-	r.endOnce.Do(func() {
-		r.mu.Lock()
-		finishedAt := r.finishedAt
-		r.mu.Unlock()
-
-		var opts []oteltrace.SpanEndOption
-		if !finishedAt.IsZero() {
-			opts = append(opts, oteltrace.WithTimestamp(finishedAt))
-		}
-		EndSpan(r.span, err, opts...)
-	})
+	return ctx, span
 }
 
 // StartScenario starts a span for a scenario, child of the span in ctx (the run span).

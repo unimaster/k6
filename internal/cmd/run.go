@@ -16,6 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"go.k6.io/k6/v2/cmd/state"
 	"go.k6.io/k6/v2/errext"
@@ -78,16 +79,22 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	// the browser module ending any open spans), but before globalCtx is
 	// cancelled by globalCancel above, since it derives its own timeout from
 	// globalCtx.
-	var shutdownTracerProvider func(timeout time.Duration)
-	// testRun is the span of the whole test run, ended right before the tracer
-	// provider is shut down so it gets exported with the rest of the spans.
-	var testRun *trace.TestRun
+	var shutdownTracerProvider func()
+	// runSpan is the span of the whole test run, ended right before the tracer
+	// provider is shut down so it gets exported with the rest of the spans. It
+	// ends at runFinishedAt, when the execution, including the teardown, has
+	// finished, so what follows, e.g. the end-of-test summary or the --linger
+	// wait, isn't part of it, while its status still reflects the final result
+	// of the test, e.g. crossed thresholds, which is only known later. If the
+	// run didn't get that far, runFinishedAt is zero and the span ends now.
+	var runSpan oteltrace.Span
+	var runFinishedAt time.Time
 	defer func() {
-		if testRun != nil {
-			testRun.End(err)
+		if runSpan != nil {
+			trace.EndSpan(runSpan, err, oteltrace.WithTimestamp(runFinishedAt))
 		}
 		if shutdownTracerProvider != nil {
-			shutdownTracerProvider(waitForTracerProviderStopTimeout)
+			shutdownTracerProvider()
 		}
 	}()
 
@@ -127,8 +134,8 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	if err = c.setupTracerProvider(globalCtx, test); err != nil {
 		return err
 	}
-	shutdownTracerProvider = func(timeout time.Duration) {
-		ctx, cancel := context.WithTimeout(globalCtx, timeout)
+	shutdownTracerProvider = func() {
+		ctx, cancel := context.WithTimeout(globalCtx, waitForTracerProviderStopTimeout)
 		defer cancel()
 		if tpErr := test.preInitState.TracerProvider.Shutdown(ctx); tpErr != nil {
 			logger.Errorf("The tracer provider didn't stop gracefully: %v", tpErr)
@@ -138,7 +145,8 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	// testCtx is globalCtx carrying the run span, so that the execution contexts derived
 	// from it below, and the teardown, are part of the test run trace.
 	tracer := trace.Tracer(test.preInitState.TracerProvider, test.preInitState.FeatureFlags)
-	testCtx, testRun := trace.StartTestRun(globalCtx, tracer, logger)
+	var testCtx context.Context
+	testCtx, runSpan = trace.StartTestRun(globalCtx, tracer, logger)
 
 	// lingerCtx is cancelled by Ctrl+C, and is used to wait for that event when
 	// k6 was started with the --linger option.
@@ -461,7 +469,7 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	// Start the test! However, we won't immediately return if there was an
 	// error, we still have things to do.
 	err = execScheduler.Run(testCtx, runCtx, samples)
-	testRun.MarkFinished()
+	runFinishedAt = time.Now()
 
 	waitTestEndDone := emitEvent(&event.Event{Type: event.TestEnd})
 	defer waitTestEndDone()

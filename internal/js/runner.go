@@ -862,7 +862,7 @@ func (u *VU) Activate(params *lib.VUActivationParams) lib.ActiveVU {
 }
 
 // RunOnce runs the configured Exec function once.
-func (u *ActiveVU) RunOnce() (err error) {
+func (u *ActiveVU) RunOnce() error {
 	select {
 	case <-u.RunContext.Done():
 		return lib.ContextErr(u.RunContext) // we are done, return
@@ -898,16 +898,14 @@ func (u *ActiveVU) RunOnce() (err error) {
 	if u.tracer != nil {
 		afterIterCtx = oteltrace.ContextWithSpan(ctx, oteltrace.SpanFromContext(u.vuCtx))
 	}
-	defer func() {
-		u.moduleVUImpl.ctx = afterIterCtx
-	}()
 	iterationSpanEnded := false
 	defer func() {
 		// The iteration span is normally ended after IterEnd below, this only ends it
 		// when the iteration panics.
 		if !iterationSpanEnded {
-			k6trace.EndSpan(iterSpan, err)
+			iterSpan.End()
 		}
+		u.moduleVUImpl.ctx = afterIterCtx
 	}()
 	u.moduleVUImpl.ctx = ctx
 

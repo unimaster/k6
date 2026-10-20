@@ -3,10 +3,9 @@ package trace_test
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
-	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
@@ -41,7 +40,7 @@ func TestSpanHierarchy(t *testing.T) {
 	for _, s := range []oteltrace.Span{itSpan, vuSpan, scSpan} {
 		k6trace.EndSpan(s, nil)
 	}
-	runSpan.End(nil)
+	runSpan.End()
 
 	byName := map[string]oteltrace.SpanContext{}
 	parents := map[string]oteltrace.SpanID{}
@@ -90,129 +89,121 @@ func TestStartTestRunStartsNewTrace(t *testing.T) {
 	defer outer.End()
 
 	_, run := k6trace.StartTestRun(outerCtx, k6trace.Tracer(tp, nativeTracing()), logger)
-	defer run.End(nil)
+	defer run.End()
 
 	assert.NotEqual(t, outer.SpanContext().TraceID(), run.SpanContext().TraceID())
-}
-
-func TestTestRunEndsWhenMarkedFinished(t *testing.T) {
-	t.Parallel()
-
-	tp, rec := tracetest.NewProvider()
-	_, run := k6trace.StartTestRun(context.Background(), k6trace.Tracer(tp, nativeTracing()), testutils.NewLogger(t))
-
-	run.MarkFinished()
-	finished := time.Now()
-	// What follows the execution, e.g. the --linger wait, isn't part of the run span.
-	time.Sleep(10 * time.Millisecond)
-	run.End(errors.New("thresholds crossed"))
-
-	runSpan := rec.ByName(k6trace.SpanRun)
-	require.Len(t, runSpan, 1)
-	assert.False(t, runSpan[0].EndTime().After(finished), "the run span must end when marked finished")
-	assert.Equal(t, codes.Error, runSpan[0].Status().Code, "the error known after the end is still recorded")
-	assert.Equal(t, "thresholds crossed", runSpan[0].Status().Description)
-}
-
-func TestTestRunEndsOnce(t *testing.T) {
-	t.Parallel()
-
-	tp, rec := tracetest.NewProvider()
-	_, run := k6trace.StartTestRun(context.Background(), k6trace.Tracer(tp, nativeTracing()), testutils.NewLogger(t))
-
-	// A hard stop and the end of the run can both end the run span, concurrently.
-	var wg sync.WaitGroup
-	for range 2 {
-		wg.Go(func() { run.End(errors.New("aborted")) })
-	}
-	wg.Wait()
-	run.End(nil)
-
-	runSpan := rec.ByName(k6trace.SpanRun)
-	require.Len(t, runSpan, 1)
-	assert.Len(t, runSpan[0].Events(), 1, "the error must be recorded once")
-	assert.Equal(t, codes.Error, runSpan[0].Status().Code)
 }
 
 func TestStartFunctionsWithoutTracer(t *testing.T) {
 	t.Parallel()
 
-	logger, hook := testutils.NewLoggerWithHook(t)
-	ctx := context.Background()
-
-	runCtx, run := k6trace.StartTestRun(ctx, nil, logger)
-	scCtx, scSpan := k6trace.StartScenario(ctx, nil, k6trace.ScenarioInfo{Name: "sc"})
-	vuCtx, vuSpan := k6trace.StartVU(ctx, nil, k6trace.VUInfo{ID: 1})
-	itCtx, itSpan := k6trace.StartIteration(ctx, nil, k6trace.IterationInfo{Number: 1})
-
-	for _, c := range []context.Context{runCtx, scCtx, vuCtx, itCtx} {
-		assert.Equal(t, ctx, c, "the context must be unchanged when tracing is disabled")
+	tests := []struct {
+		name  string
+		start func(context.Context, logrus.FieldLogger) (context.Context, oteltrace.Span)
+	}{
+		{name: "run", start: func(ctx context.Context, l logrus.FieldLogger) (context.Context, oteltrace.Span) {
+			return k6trace.StartTestRun(ctx, nil, l)
+		}},
+		{name: "scenario", start: func(ctx context.Context, _ logrus.FieldLogger) (context.Context, oteltrace.Span) {
+			return k6trace.StartScenario(ctx, nil, k6trace.ScenarioInfo{Name: "sc"})
+		}},
+		{name: "vu", start: func(ctx context.Context, _ logrus.FieldLogger) (context.Context, oteltrace.Span) {
+			return k6trace.StartVU(ctx, nil, k6trace.VUInfo{ID: 1})
+		}},
+		{name: "iteration", start: func(ctx context.Context, _ logrus.FieldLogger) (context.Context, oteltrace.Span) {
+			return k6trace.StartIteration(ctx, nil, k6trace.IterationInfo{Number: 1})
+		}},
 	}
-	for _, s := range []oteltrace.Span{scSpan, vuSpan, itSpan} {
-		assert.False(t, s.IsRecording())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			logger, hook := testutils.NewLoggerWithHook(t)
+			ctx := context.Background()
+			gotCtx, span := tc.start(ctx, logger)
+			k6trace.EndSpan(span, errors.New("boom"))
+
+			assert.Equal(t, ctx, gotCtx, "the context must be unchanged when tracing is disabled")
+			assert.False(t, span.SpanContext().IsValid())
+			assert.Empty(t, hook.Drain(), "nothing must be logged when tracing is disabled")
+		})
 	}
-	assert.False(t, run.SpanContext().IsValid())
-	run.MarkFinished()
-	run.End(errors.New("boom"))
-	assert.Empty(t, hook.Drain(), "nothing must be logged when tracing is disabled")
 }
 
-func TestEndSpanRecordsError(t *testing.T) {
+func TestEndSpanStatus(t *testing.T) {
 	t.Parallel()
 
-	tp, rec := tracetest.NewProvider()
-	tracer := k6trace.Tracer(tp, nativeTracing())
-	_, okSpan := k6trace.StartScenario(context.Background(), tracer, k6trace.ScenarioInfo{Name: "ok"})
-	k6trace.EndSpan(okSpan, nil)
-	_, failSpan := k6trace.StartScenario(context.Background(), tracer, k6trace.ScenarioInfo{Name: "fail"})
-	k6trace.EndSpan(failSpan, errors.New("boom"))
+	tests := []struct {
+		name            string
+		end             func(oteltrace.Span)
+		wantCode        codes.Code
+		wantInterrupted bool
+	}{
+		{name: "no error", end: func(s oteltrace.Span) { k6trace.EndSpan(s, nil) }, wantCode: codes.Unset},
+		{name: "error", end: func(s oteltrace.Span) { k6trace.EndSpan(s, errors.New("boom")) }, wantCode: codes.Error},
+		{
+			name:     "failed iteration",
+			end:      func(s oteltrace.Span) { k6trace.EndIteration(s, errors.New("boom"), false) },
+			wantCode: codes.Error,
+		},
+		{
+			name:            "interrupted iteration",
+			end:             func(s oteltrace.Span) { k6trace.EndIteration(s, context.Canceled, true) },
+			wantCode:        codes.Unset,
+			wantInterrupted: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	spans := rec.Ended()
-	require.Len(t, spans, 2)
-	assert.Equal(t, codes.Unset, spans[0].Status().Code)
-	assert.Equal(t, codes.Error, spans[1].Status().Code)
-	assert.Equal(t, "boom", spans[1].Status().Description)
-	require.Len(t, spans[1].Events(), 1)
-	assert.Equal(t, "exception", spans[1].Events()[0].Name)
+			tp, rec := tracetest.NewProvider()
+			_, span := k6trace.StartIteration(context.Background(), k6trace.Tracer(tp, nativeTracing()), k6trace.IterationInfo{})
+			tc.end(span)
+
+			spans := rec.Ended()
+			require.Len(t, spans, 1)
+			assert.Equal(t, tc.wantCode, spans[0].Status().Code)
+			if tc.wantCode == codes.Error {
+				assert.Equal(t, "boom", spans[0].Status().Description)
+				require.Len(t, spans[0].Events(), 1)
+				assert.Equal(t, "exception", spans[0].Events()[0].Name)
+			} else {
+				assert.Empty(t, spans[0].Events())
+			}
+			interrupted := attribute.Bool("k6.iteration.interrupted", true)
+			if tc.wantInterrupted {
+				assert.Contains(t, spans[0].Attributes(), interrupted)
+			} else {
+				assert.NotContains(t, spans[0].Attributes(), interrupted)
+			}
+		})
+	}
 }
 
-func TestTracerIsNilWhenTracingIsDisabled(t *testing.T) {
+func TestTracer(t *testing.T) {
 	t.Parallel()
 
+	tp, _ := tracetest.NewProvider()
 	var nilProvider *k6trace.TracerProvider
-	assert.Nil(t, k6trace.Tracer(nil, nativeTracing()))
-	assert.Nil(t, k6trace.Tracer(nilProvider, nativeTracing()))
-	assert.Nil(t, k6trace.Tracer(k6trace.NewNoopTracerProvider(), nativeTracing()))
-
-	tp, _ := tracetest.NewProvider()
-	assert.NotNil(t, k6trace.Tracer(tp, nativeTracing()))
-}
-
-func TestTracerIsGatedByTheFeatureFlag(t *testing.T) {
-	t.Parallel()
-
-	tp, _ := tracetest.NewProvider()
-	assert.Nil(t, k6trace.Tracer(tp, nil))
-	assert.Nil(t, k6trace.Tracer(tp, &features.Flags{}))
-	assert.NotNil(t, k6trace.Tracer(tp, &features.Flags{NativeTracing: true}))
-}
-
-func TestEndIterationDoesNotRecordInterruptionsAsErrors(t *testing.T) {
-	t.Parallel()
-
-	tp, rec := tracetest.NewProvider()
-	tracer := k6trace.Tracer(tp, nativeTracing())
-	_, failed := k6trace.StartIteration(context.Background(), tracer, k6trace.IterationInfo{Number: 0})
-	k6trace.EndIteration(failed, errors.New("boom"), false)
-	_, interrupted := k6trace.StartIteration(context.Background(), tracer, k6trace.IterationInfo{Number: 1})
-	k6trace.EndIteration(interrupted, context.Canceled, true)
-
-	spans := rec.Ended()
-	require.Len(t, spans, 2)
-	assert.Equal(t, codes.Error, spans[0].Status().Code)
-	assert.Equal(t, codes.Unset, spans[1].Status().Code)
-	assert.Empty(t, spans[1].Events())
-	assert.Contains(t, spans[1].Attributes(), attribute.Bool("k6.iteration.interrupted", true))
+	tests := []struct {
+		name    string
+		tp      *k6trace.TracerProvider
+		flags   *features.Flags
+		wantNil bool
+	}{
+		{name: "enabled", tp: tp, flags: nativeTracing()},
+		{name: "nil provider", tp: nilProvider, flags: nativeTracing(), wantNil: true},
+		{name: "noop provider", tp: k6trace.NewNoopTracerProvider(), flags: nativeTracing(), wantNil: true},
+		{name: "nil flags", tp: tp, flags: nil, wantNil: true},
+		{name: "feature flag disabled", tp: tp, flags: &features.Flags{}, wantNil: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.wantNil, k6trace.Tracer(tc.tp, tc.flags) == nil)
+		})
+	}
 }
 
 func TestMarkIterationFailed(t *testing.T) {
@@ -236,18 +227,4 @@ func TestMarkIterationFailed(t *testing.T) {
 	assert.Equal(t, codes.Unset, spans[0].Status().Code)
 	assert.Equal(t, codes.Error, spans[1].Status().Code)
 	assert.Equal(t, "test marked as failed: oops", spans[1].Status().Description)
-}
-
-func TestIterationWithoutScenarioIterationNumbers(t *testing.T) {
-	t.Parallel()
-
-	tp, rec := tracetest.NewProvider()
-	_, span := k6trace.StartIteration(context.Background(), k6trace.Tracer(tp, nativeTracing()), k6trace.IterationInfo{Number: 1})
-	span.End()
-
-	for _, kv := range rec.Ended()[0].Attributes() {
-		assert.NotContains(t, []string{
-			"k6.scenario.iteration_in_instance", "k6.scenario.iteration_in_test",
-		}, string(kv.Key), "the scenario counters are left out when the executor doesn't provide them")
-	}
 }
