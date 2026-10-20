@@ -873,18 +873,8 @@ func (u *ActiveVU) RunOnce() (err error) {
 		<-u.busy // unlock deactivation again
 	}()
 
-	// Unmarshall the setupData only the first time for each VU so that VUs are isolated but we
-	// still don't use too much CPU in the middle test
-	if u.setupData == nil {
-		if u.Runner.setupData != nil {
-			var data any
-			if err := json.Unmarshal(u.Runner.setupData, &data); err != nil {
-				return fmt.Errorf("error unmarshaling setup data for the iteration from JSON: %w", err)
-			}
-			u.setupData = u.Runtime.ToValue(data)
-		} else {
-			u.setupData = sobek.Undefined()
-		}
+	if err := u.loadSetupData(); err != nil {
+		return err
 	}
 
 	fn := u.getCallableExport(u.Exec)
@@ -959,6 +949,24 @@ func (u *ActiveVU) RunOnce() (err error) {
 	}
 
 	return err
+}
+
+// loadSetupData unmarshals the setupData only the first time for each VU so that VUs are
+// isolated but we still don't use too much CPU in the middle test.
+func (u *ActiveVU) loadSetupData() error {
+	if u.setupData != nil {
+		return nil
+	}
+	if u.Runner.setupData == nil {
+		u.setupData = sobek.Undefined()
+		return nil
+	}
+	var data any
+	if err := json.Unmarshal(u.Runner.setupData, &data); err != nil {
+		return fmt.Errorf("error unmarshaling setup data for the iteration from JSON: %w", err)
+	}
+	u.setupData = u.Runtime.ToValue(data)
+	return nil
 }
 
 // isInterrupted reports whether an iteration was interrupted rather than failed: the script
